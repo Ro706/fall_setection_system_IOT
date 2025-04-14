@@ -1,0 +1,282 @@
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <vector>
+
+// WiFi Credentials
+const char* ssid = "WIFI NAME";
+const char* password = "WIFI PASSWORD";
+
+// Google Apps Script Web App URL
+const char* scriptURL = "SCRIPT URL";
+
+// ThingSpeak Channel Details
+const char* thingSpeakServer = "http://api.thingspeak.com/update";
+const char* thingSpeakApiKey = "Thingspeack API";
+
+Adafruit_MPU6050 mpu;
+
+const int buzzerPin = 23;
+const int ledPin = 2;
+const float FALL_THRESHOLD = 1.5;
+const float TILT_ANGLE_THRESHOLD = 45.0;
+const float GYRO_CHANGE_THRESHOLD = 3.0;
+long fallStartTime = 0;
+bool fallConfirmed = false;
+
+float accelX_avg = 0, accelY_avg = 0, accelZ_avg = 0;
+float gyroX_avg = 0, gyroY_avg = 0, gyroZ_avg = 0;
+const int WS = 5;
+float aX_window[WS], aY_window[WS], aZ_window[WS];
+float gX_window[WS], gY_window[WS], gZ_window[WS];
+int WI = 0;
+
+String externalIP = "";
+String latitude = "";
+String longitude = "";
+
+void setup() {
+    Serial.begin(115200);
+    Wire.begin();
+
+    if (!mpu.begin()) {
+        Serial.println("MPU6050 not connected!");
+        while (1);
+    }
+
+    pinMode(buzzerPin, OUTPUT);
+    pinMode(ledPin, OUTPUT);
+
+    Serial.print("Connecting to WiFi");
+    WiFi.begin(ssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
+    }
+    Serial.println("\nWiFi connected!");
+    Serial.print("Local IP Address: ");
+    Serial.println(WiFi.localIP());
+
+    getExternalIP(); // Get external IP and geolocation
+}
+
+void loop() {
+    sensors_event_t accel, gyro, temp;
+    mpu.getEvent(&accel, &gyro, &temp);
+
+    float accelX = accel.acceleration.x;
+    float accelY = accel.acceleration.y;
+    float accelZ = accel.acceleration.z;
+    float gyroX = gyro.gyro.x;
+    float gyroY = gyro.gyro.y;
+    float gyroZ = gyro.gyro.z;
+
+    float tiltAngleX = atan2(accelY, accelZ) * 180 / PI;
+    float tiltAngleY = atan2(accelX, accelZ) * 180 / PI;
+
+    filterData(accelX, accelY, accelZ, gyroX, gyroY, gyroZ);
+    detectFall(accelX_avg, accelY_avg, accelZ_avg, gyroX_avg, gyroY_avg, gyroZ_avg, tiltAngleX, tiltAngleY);
+
+    delay(10);
+}
+
+void filterData(float accelX, float accelY, float accelZ, float gyroX, float gyroY, float gyroZ) {
+    aX_window[WI] = accelX; aY_window[WI] = accelY; aZ_window[WI] = accelZ;
+    gX_window[WI] = gyroX; gY_window[WI] = gyroY; gZ_window[WI] = gyroZ;
+
+    accelX_avg = (accelX_avg * (WS - 1) + accelX) / WS;
+    accelY_avg = (accelY_avg * (WS - 1) + accelY) / WS;
+    accelZ_avg = (accelZ_avg * (WS - 1) + accelZ) / WS;
+    gyroX_avg = (gyroX_avg * (WS - 1) + gyroX) / WS;
+    gyroY_avg = (gyroY_avg * (WS - 1) + gyroY) / WS;
+    gyroZ_avg = (gyroZ_avg * (WS - 1) + gyroZ) / WS;
+
+    WI = (WI + 1) % WS;
+}
+
+void detectFall(float accelX, float accelY, float accelZ, float gyroX, float gyroY, float gyroZ, float tiltX, float tiltY) {
+    float totalAccel = sqrt(accelX * accelX + accelY * accelY + accelZ * accelZ);
+    float totalGyro = sqrt(gyroX * gyroX + gyroY * gyroY + gyroZ * gyroZ);
+
+    if (totalAccel < FALL_THRESHOLD || totalGyro > GYRO_CHANGE_THRESHOLD) {
+        if (!fallConfirmed) {
+            fallStartTime = millis();
+            fallConfirmed = true;
+            Serial.println("Possible fall detected...");
+        }
+    }
+
+    if (fallConfirmed && (millis() - fallStartTime > 3000)) {
+        if (abs(tiltX) > TILT_ANGLE_THRESHOLD || abs(tiltY) > TILT_ANGLE_THRESHOLD) {
+            Serial.println("Fall confirmed! Sending alert...");
+            alertFall();
+            sendFallAlert("Fall Detected");
+            sendToThingSpeak(accelZ, gyroY, 1); // Send fall status to ThingSpeak
+        } else {
+            Serial.println("False alarm.");
+            sendToThingSpeak(accelZ, gyroY, 0); // Send false alarm status to ThingSpeak
+        }
+        fallConfirmed = false; // Reset fallConfirmed after processing the event
+    }
+}
+
+void alertFall() {
+    for (int i = 0; i < 3; i++) {
+        tone(buzzerPin, 4500, 500);
+        digitalWrite(ledPin, HIGH);
+        delay(300);
+        digitalWrite(buzzerPin, LOW);
+        digitalWrite(ledPin, LOW);
+        delay(200);
+    }
+}
+
+void sendFallAlert(String message) {
+    if (WiFi.status() == WL_CONNECTED) {
+        HTTPClient http;
+        http.begin(scriptURL);
+        http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+        String postData = "event=" + message + "&device_id=ESP32_001&user=Rohit";
+
+        if (!externalIP.isEmpty() && !latitude.isEmpty() && !longitude.isEmpty()) {
+            postData += "&external_ip=" + externalIP + "&latitude=" + latitude + "&longitude=" + longitude;
+        }
+
+        int httpCode = http.POST(postData);
+
+        Serial.print("HTTP Response code: ");
+        Serial.println(httpCode);
+
+        if (httpCode == 302) { // Check for redirection
+            String payload = http.getString();
+            int locationIndex = payload.indexOf("href=\"") + 6;
+            int locationEndIndex = payload.indexOf("\"", locationIndex);
+            String redirectURL = payload.substring(locationIndex, locationEndIndex);
+
+            Serial.print("Redirecting to: ");
+            Serial.println(redirectURL);
+
+            http.end();
+
+            // Make a second request to the redirected URL
+            http.begin(redirectURL);
+            http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+            httpCode = http.POST(postData);
+
+            Serial.print("HTTP Response code after redirection: ");
+            Serial.println(httpCode);
+
+            if (httpCode > 0) {
+                String response = http.getString();
+                Serial.println("Server response:");
+                Serial.println(response);
+            } else {
+                Serial.println("POST failed after redirection.");
+            }
+        } else if (httpCode > 0) {
+            String response = http.getString();
+            Serial.println("Server response:");
+            Serial.println(response);
+        } else {
+            Serial.println("POST failed.");
+        }
+
+        http.end();
+    } else {
+        Serial.println("WiFi not connected.");
+    }
+}
+
+void sendToThingSpeak(float accZ, float gyroY, int fallStatus) {
+    if (WiFi.status() == WL_CONNECTED) {
+        HTTPClient http;
+        String url = String(thingSpeakServer) + "?api_key=" + String(thingSpeakApiKey) +
+                     "&field1=" + String(accZ) +
+                     "&field2=" + String(gyroY) +
+                     "&field3=" + String(fallStatus) +
+                     "&field4=" + String("Rohit"); // Include user information
+
+        http.begin(url);
+        int httpCode = http.GET();
+
+        Serial.print("HTTP Response code: ");
+        Serial.println(httpCode);
+
+        if (httpCode > 0) {
+            String response = http.getString();
+            Serial.println("Server response:");
+            Serial.println(response);
+        } else {
+            Serial.println("GET request failed.");
+        }
+
+        http.end();
+    } else {
+        Serial.println("WiFi not connected.");
+    }
+}
+
+
+
+void getExternalIP() {
+    HTTPClient http;
+    http.begin("http://api.ipify.org");
+    int httpCode = http.GET();
+    if (httpCode == HTTP_CODE_OK) {
+        externalIP = http.getString();
+        Serial.print("External IP Address: ");
+        Serial.println(externalIP);
+        getGeolocation(externalIP);
+    } else {
+        Serial.println("Error getting external IP");
+        externalIP = ""; // Set to empty string in case of error
+    }
+    http.end();
+}
+
+void getGeolocation(String ipAddress) {
+    HTTPClient http;
+    String geolocationURL = "http://ip-api.com/json/" + ipAddress; // Using ip-api.com
+    http.begin(geolocationURL);
+    int httpCode = http.GET();
+    if (httpCode == HTTP_CODE_OK) {
+        String payload = http.getString();
+        // Parse the JSON response
+        int latStart = payload.indexOf("\"lat\":") + 6;
+        int latEnd = payload.indexOf(",", latStart);
+        latitude = payload.substring(latStart, latEnd);
+        int lonStart = payload.indexOf("\"lon\":") + 6;
+        int lonEnd = payload.indexOf("}", lonStart);
+        longitude = payload.substring(lonStart, lonEnd);
+        Serial.print("Latitude: ");
+        Serial.println(latitude);
+        Serial.print("Longitude: ");
+        Serial.println(longitude);
+    } else {
+        Serial.println("Error getting geolocation");
+        latitude = "";  // Set to empty string in case of error
+        longitude = ""; // Set to empty string in case of error
+    }
+    http.end();
+}
+
+
+// Helper function for URL encoding
+String urlEncode(String str) {
+    String encodedString = "";
+    for (char c : str) {
+        if (isalnum(c) || (c == '-') || (c == '_') || (c == '.') || (c == '~')) {
+            encodedString += c;
+        } else if (c == ' ') {
+            encodedString += '+';
+        } else {
+            encodedString += '%';
+            if (c < 16) encodedString += '0';
+            encodedString += String(c, HEX);
+        }
+    }
+    return encodedString;
+}
