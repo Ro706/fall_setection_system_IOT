@@ -119,4 +119,7 @@ To deploy your Google Apps Script:
 - Handles **HTTP redirections** from Google Apps Script responses.
 - Designed to be **easily extendable** for additional alert methods like **SMS** or **email notifications**.
 
+https://github.com/user-attachments/assets/d1d7f829-b8ae-469e-ae9c-7d10cad26eee
+
+
 
